@@ -175,9 +175,10 @@ normalize_transcript_path() {
     case "$p" in
         file://*) p="${p#file://}" ;;
     esac
+    local tilde="~"
     case "$p" in
-        "~") p="$HOME" ;;
-        "~/"*) p="$HOME/${p#~/}" ;;
+        "$tilde") p="$HOME" ;;
+        "$tilde/"*) p="$HOME/${p#"$tilde"/}" ;;
     esac
     if [ ! -f "$p" ]; then
         local alt="${p/\/antigravity\//\/antigravity-cli\/}"
