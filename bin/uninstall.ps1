@@ -1,45 +1,56 @@
 # Uninstaller script for Windows (PowerShell)
-# Reverts settings.json statusLine configuration and removes installed files.
+# Restores previous statusLine configuration (if backed up) and removes installed script.
 $ErrorActionPreference = "Stop"
 
 $userProfile = [System.Environment]::GetFolderPath("UserProfile")
 $geminiDir = Join-Path $userProfile ".gemini"
 $destScript = Join-Path $geminiDir "statusline.ps1"
 $configFile = Join-Path $geminiDir "statusline.json"
+$backupFile = Join-Path $geminiDir "statusline.prev.json"
 $settingsFile = Join-Path $geminiDir "antigravity-cli\settings.json"
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 Write-Host "Uninstalling Unified AGY Statusline..." -ForegroundColor Cyan
 
-# 1. Update settings.json statusLine
 if (Test-Path $settingsFile) {
     try {
-        $settingsJson = Get-Content $settingsFile -Raw
+        $settingsJson = [System.IO.File]::ReadAllText($settingsFile, [System.Text.Encoding]::UTF8)
         $settings = ConvertFrom-Json $settingsJson
 
-        if ($null -ne $settings.statusLine) {
-            $settings.statusLine.type = ""
-            $settings.statusLine.command = ""
-            $settings.statusLine.enabled = $false
+        if (Test-Path $backupFile) {
+            $prevRaw = [System.IO.File]::ReadAllText($backupFile, [System.Text.Encoding]::UTF8)
+            $prevObj = ConvertFrom-Json $prevRaw
+            if ($prevObj.PSObject.Properties["__absent__"] -and $prevObj.__absent__) {
+                $settings.PSObject.Properties.Remove("statusLine")
+                Write-Host "Removed statusLine configuration (none existed prior to install)." -ForegroundColor Green
+            } else {
+                $settings | Add-Member -MemberType NoteProperty -Name "statusLine" -Value $prevObj -Force
+                Write-Host "Restored previous statusLine configuration from backup." -ForegroundColor Green
+            }
+            Remove-Item $backupFile -Force
+        } elseif ($null -ne $settings.PSObject.Properties["statusLine"]) {
+            $fallback = [PSCustomObject]@{
+                type = ""
+                command = ""
+                enabled = $false
+            }
+            $settings | Add-Member -MemberType NoteProperty -Name "statusLine" -Value $fallback -Force
+            Write-Host "Disabled statusLine configuration in settings.json." -ForegroundColor Green
         }
 
-        # Convert back to JSON and write to file
         $newJson = ConvertTo-Json $settings -Depth 10
-        Set-Content -Path $settingsFile -Value $newJson -Force
-        Write-Host "Reverted settings.json statusLine configuration." -ForegroundColor Green
+        [System.IO.File]::WriteAllText($settingsFile, $newJson, $utf8NoBom)
     } catch {
         Write-Warning "Could not update settings.json: $_"
     }
 }
 
-# 2. Remove script file
 if (Test-Path $destScript) {
     Remove-Item $destScript -Force
     Write-Host "Removed script file: $destScript" -ForegroundColor Green
 }
 
-# 3. Prompt or ask about removing the config file
 if (Test-Path $configFile) {
-    # Non-interactive default: keep the config file so settings aren't lost
     Write-Host "Note: Configuration file left at $configFile to preserve your settings." -ForegroundColor Yellow
 }
 

@@ -2,12 +2,12 @@
 set -f
 
 # ─── Ensure graceful failure ──────────────────────────────────────────────────
-trap 'printf "agy\n"; exit 0' ERR
+trap 'printf "agy (error at line %s)\n" "$LINENO"; exit 0' ERR
 
 # ─── Read Stdin ─────────────────────────────────────────────────────────────
 input=$(cat)
 if [ -z "$input" ]; then
-    printf "agy"
+    printf "agy\n"
     exit 0
 fi
 
@@ -42,7 +42,8 @@ fi
     read -r Q_GEM_WK_REM
     read -r Q_GEM_WK_RESET
 } <<<"$(
-    jq -r '
+    {
+        jq -r '
     (.agent_state // "idle"),
     (.context_window?.used_percentage? // 0),
     (.context_window?.context_window_size? // 0),
@@ -72,12 +73,14 @@ fi
     (.quota?["gemini-weekly"]?.remaining_fraction? // "null"),
     (.quota?["gemini-weekly"]?.reset_time? // "null")
   ' <<<"$input" 2>/dev/null || printf "idle\n0\n0\n0\n0\n0\n0\n0\n\n\nfalse\nfalse\n0\n0\n0\n\n\n\n80\n\nnull\nnull\nnull\nnull\nnull\nnull\nnull\nnull\n"
+    } | tr -d '\r'
 )"
 
 # ─── Configuration Constants ──────────────────────────────────────────────────
 CONFIG_LAYOUT_WIDE_COLS=120
 CONFIG_LAYOUT_MED_COLS=100
 CONFIG_BAR_LEN_CTX=15
+CONFIG_BAR_LEN_CTX_NARROW=8
 charSlash="/"
 charPipe="│"
 charSigma="Σ"
@@ -87,6 +90,10 @@ CONFIG_CTX_CRIT_PCT=90
 CONFIG_QUOTA_INFO_PCT=50
 CONFIG_QUOTA_WARN_PCT=70
 CONFIG_QUOTA_CRIT_PCT=90
+
+if ! [[ "$COLS" =~ ^[0-9]+$ ]] || [ "$COLS" -lt 20 ]; then
+    COLS=80
+fi
 
 # ─── Configuration Loader (Optional ~/.gemini/statusline.json) ───────────────
 CONFIG_PATH="$HOME/.gemini/statusline.json"
@@ -102,12 +109,14 @@ if [ -f "$CONFIG_PATH" ]; then
         read -r cfg_hide_zero
         read -r cfg_state
     } <<<"$(
-        jq -r '
+        {
+            jq -r '
           (if .show_quota == null then true else .show_quota end),
           (if .show_additional_stats == null then true else .show_additional_stats end),
           (if .hide_zero_stats == null then true else .hide_zero_stats end),
           (if .show_state_indicator == null then true else .show_state_indicator end)
         ' "$CONFIG_PATH" 2>/dev/null || printf "true\ntrue\ntrue\ntrue\n"
+        } | tr -d '\r'
     )"
     [ "$cfg_quota" = "false" ] && show_quota=false
     [ "$cfg_stats" = "false" ] && show_additional_stats=false
@@ -116,14 +125,9 @@ if [ -f "$CONFIG_PATH" ]; then
 fi
 
 # ─── ANSI Colors & Formatting (Standard 16 colors) ───────────────────────────
-R="\033[0m" # Reset
-B="\033[1m" # Bold
-I="\033[3m" # Italic
-# D="\033[2m"         # Dim (uncomment for custom theming)
-# FG_GREEN="\033[32m"
-# FG_YELLOW="\033[33m"
-# FG_CYAN="\033[36m"
-# FG_MAGENTA="\033[35m"
+R="\033[0m"
+B="\033[1m"
+I="\033[3m"
 FG_WHITE="\033[37m"
 FG_GRAY="\033[90m"
 FG_BRIGHT_RED="\033[91m"
@@ -145,10 +149,10 @@ DIRNAME=$(basename "$CWD")
 # ─── Fallback Git Branch Detection ───────────────────────────────────────────
 if [ -z "$VCS_BRANCH" ] || [ "$VCS_BRANCH" = "null" ]; then
     if [ -n "$CWD" ] && [ -d "$CWD" ]; then
-        git_branch=$(git -C "$CWD" branch --show-current 2>/dev/null)
+        git_branch=$(git -C "$CWD" branch --show-current 2>/dev/null || true)
         if [ -n "$git_branch" ]; then
             VCS_BRANCH="$git_branch"
-            git_status=$(git -C "$CWD" status --porcelain 2>/dev/null)
+            git_status=$(git -C "$CWD" status --porcelain 2>/dev/null || true)
             if [ -n "$git_status" ]; then
                 VCS_DIRTY="true"
             else
@@ -181,10 +185,12 @@ normalize_transcript_path() {
         "$tilde/"*) p="$HOME/${p#"$tilde"/}" ;;
     esac
     if [ ! -f "$p" ]; then
-        local alt="${p/\/antigravity\//\/antigravity-cli\/}"
-        if [ -f "$alt" ]; then
-            p="$alt"
-        fi
+        case "$p" in
+            */antigravity/*)
+                local alt="${p%%/antigravity/*}/antigravity-cli/${p#*/antigravity/}"
+                [ -f "$alt" ] && p="$alt"
+                ;;
+        esac
     fi
     printf "%s" "$p"
 }
@@ -192,114 +198,294 @@ normalize_transcript_path() {
 parse_transcript_metrics() {
     local tpath="$1"
     if [ -z "$tpath" ] || [ ! -f "$tpath" ]; then
-        printf "0 0 0 0\n"
+        printf "0 0 0 0 0\n"
         return
     fi
-    LC_NUMERIC=C awk '
-    function json_str(s, key,    pat, idx, rest, q) {
-        pat = "\"" key "\":\""
-        idx = index(s, pat)
-        if (idx == 0) return ""
-        rest = substr(s, idx + length(pat))
-        q = index(rest, "\"")
-        if (q == 0) return ""
-        return substr(rest, 1, q - 1)
-    }
-    function json_num(s, key,    pat, idx, rest) {
-        pat = "\"" key "\":"
-        idx = index(s, pat)
-        if (idx == 0) return 0
-        rest = substr(s, idx + length(pat))
-        return rest + 0
-    }
-    function iso_to_epoch(ts,    y, m, d, H, M, S, y_adj, era, yoe, m_adj, doy, doe, days, tail, tz_pos, tz_sign, tz_h, tz_m, tz_off) {
-        if (length(ts) < 19) return -1
-        y = substr(ts, 1, 4) + 0
-        m = substr(ts, 6, 2) + 0
-        d = substr(ts, 9, 2) + 0
-        H = substr(ts, 12, 2) + 0
-        M = substr(ts, 15, 2) + 0
-        S = substr(ts, 18) + 0
-        if (y < 1970 || m < 1 || m > 12 || d < 1 || d > 31) return -1
-        tz_off = 0
-        tail = substr(ts, 20)
-        tz_pos = index(tail, "+")
-        tz_sign = 1
-        if (tz_pos == 0) {
-            tz_pos = index(tail, "-")
-            tz_sign = -1
-        }
-        if (tz_pos > 0) {
-            tz_h = substr(tail, tz_pos + 1, 2) + 0
-            tz_m = substr(tail, tz_pos + 4, 2) + 0
-            tz_off = tz_sign * (tz_h * 3600 + tz_m * 60)
-        }
-        y_adj = y - (m <= 2 ? 1 : 0)
-        era = int(y_adj / 400)
-        yoe = y_adj - era * 400
-        m_adj = m + (m > 2 ? -3 : 9)
-        doy = int((153 * m_adj + 2) / 5) + d - 1
-        doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
-        days = era * 146097 + doe - 719468
-        return days * 86400 + H * 3600 + M * 60 + S - tz_off
-    }
+
+    local file_size
+    file_size=$(wc -c <"$tpath" 2>/dev/null | tr -d '[:space:]' || echo 0)
+    if ! [[ "$file_size" =~ ^[0-9]+$ ]] || [ "$file_size" -eq 0 ]; then
+        printf "0 0 0 0 0\n"
+        return
+    fi
+
+    local path_hash cache_dir cache_file
+    path_hash=$(printf "%s" "$tpath" | cksum | awk '{print $1}')
+    cache_dir="${TMPDIR:-/tmp}"
+    cache_file="${cache_dir%/}/agy_sl_${path_hash}.cache"
+
+    local c_offset=0 c_turns=0 c_planners=0 c_compacts=0 c_skip_drop=0 c_sigma=0
+    local c_prev_ctx=0 c_prev_planner=0 c_prev_out=0 c_prev_ts=-1 c_samples=""
+
+    if [ -f "$cache_file" ]; then
+        local cached_path=""
+        {
+            IFS= read -r cached_path || true
+            IFS= read -r c_offset c_turns c_planners c_compacts c_skip_drop c_sigma c_prev_ctx c_prev_planner c_prev_out c_prev_ts c_samples || true
+        } <"$cache_file"
+        if [ "$cached_path" != "$tpath" ] || ! [[ "${c_offset:-}" =~ ^[0-9]+$ ]] || [ "$file_size" -lt "$c_offset" ]; then
+            c_offset=0
+            c_turns=0
+            c_planners=0
+            c_compacts=0
+            c_skip_drop=0
+            c_sigma=0
+            c_prev_ctx=0
+            c_prev_planner=0
+            c_prev_out=0
+            c_prev_ts=-1
+            c_samples=""
+        fi
+    fi
+
+    if [ "$file_size" -gt "$c_offset" ]; then
+        local ends_nl new_offset="$file_size" complete_bytes=0
+        ends_nl=$(tail -c 1 "$tpath" 2>/dev/null | wc -l | tr -d '[:space:]' || echo 0)
+        if [ "$ends_nl" -eq 1 ]; then
+            complete_bytes=$((file_size - c_offset))
+        else
+            complete_bytes=$(tail -c +"$((c_offset + 1))" "$tpath" 2>/dev/null | sed '$d' | wc -c | tr -d '[:space:]' || echo 0)
+            new_offset=$((c_offset + complete_bytes))
+        fi
+
+        if [ "$complete_bytes" -gt 0 ]; then
+            local new_state
+            new_state=$(
+                tail -c +"$((c_offset + 1))" "$tpath" 2>/dev/null | head -c "$complete_bytes" | jq -Rr '
+                            try fromjson catch empty |
+                            select(type == "object") |
+                            [
+                                (.type // ""),
+                                (.created_at // ""),
+                                (.input_tokens // 0),
+                                (.cache_read_tokens // 0),
+                                (.cache_creation_tokens // 0),
+                                (.output_tokens // 0)
+                            ] | @tsv
+                        ' 2>/dev/null | tr -d '\r' | LC_NUMERIC=C awk -F'\t' \
+                    -v turns="$c_turns" \
+                    -v planners="$c_planners" \
+                    -v compacts="$c_compacts" \
+                    -v skip_drop="$c_skip_drop" \
+                    -v sigma="$c_sigma" \
+                    -v prev_ctx="$c_prev_ctx" \
+                    -v prev_planner="$c_prev_planner" \
+                    -v prev_out="$c_prev_out" \
+                    -v prev_ts="$c_prev_ts" \
+                    -v samples="$c_samples" '
+                        function iso_to_epoch(ts,    y, m, d, H, M, S, y_adj, era, yoe, m_adj, doy, doe, days, tail, tz_pos, tz_sign, tz_h, tz_m, tz_off) {
+                            if (length(ts) < 19) return -1
+                            y = substr(ts, 1, 4) + 0
+                            m = substr(ts, 6, 2) + 0
+                            d = substr(ts, 9, 2) + 0
+                            H = substr(ts, 12, 2) + 0
+                            M = substr(ts, 15, 2) + 0
+                            S = substr(ts, 18) + 0
+                            if (y < 1970 || m < 1 || m > 12 || d < 1 || d > 31) return -1
+                            tz_off = 0
+                            tail = substr(ts, 20)
+                            tz_pos = index(tail, "+")
+                            tz_sign = 1
+                            if (tz_pos == 0) {
+                                tz_pos = index(tail, "-")
+                                tz_sign = -1
+                            }
+                            if (tz_pos > 0) {
+                                tz_h = substr(tail, tz_pos + 1, 2) + 0
+                                tz_m = substr(tail, tz_pos + 4, 2) + 0
+                                tz_off = tz_sign * (tz_h * 3600 + tz_m * 60)
+                            }
+                            y_adj = y - (m <= 2 ? 1 : 0)
+                            era = int(y_adj / 400)
+                            yoe = y_adj - era * 400
+                            m_adj = m + (m > 2 ? -3 : 9)
+                            doy = int((153 * m_adj + 2) / 5) + d - 1
+                            doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+                            days = era * 146097 + doe - 719468
+                            return days * 86400 + H * 3600 + M * 60 + S - tz_off
+                        }
+                        BEGIN {
+                            n_samp = 0
+                            if (samples != "") {
+                                n_samp = split(samples, samp_arr, ",")
+                            }
+                        }
+                        {
+                            stype = $1
+                            if (stype == "") next
+                            ts = ($2 != "") ? iso_to_epoch($2) : -1
+                            if (prev_planner && stype == "GENERIC" && ts >= 0 && prev_ts >= 0) {
+                                dt = ts - prev_ts
+                                if (dt >= 1.0 && dt <= 120.0 && prev_out > 0) {
+                                    n_samp++
+                                    samp_arr[n_samp] = prev_out ":" dt
+                                }
+                            }
+                            prev_planner = 0
+                            if (stype == "USER_INPUT") {
+                                turns++
+                            } else if (stype == "CHECKPOINT" || stype == "COMPACT") {
+                                compacts++
+                                skip_drop = 1
+                            } else if (stype == "PLANNER_RESPONSE") {
+                                planners++
+                                s_in = $3 + 0
+                                s_cr = $4 + 0
+                                s_cc = $5 + 0
+                                s_out = $6 + 0
+                                sigma += s_in + s_cr + s_cc + s_out
+                                cur_ctx = s_in + s_cr
+                                if (skip_drop == 0 && prev_ctx > 0 && (prev_ctx - cur_ctx) > 30000) {
+                                    compacts++
+                                }
+                                skip_drop = 0
+                                prev_ctx = cur_ctx
+                                prev_planner = 1
+                                prev_out = s_out
+                                prev_ts = ts
+                            }
+                        }
+                        END {
+                            start_idx = (n_samp > 10) ? (n_samp - 9) : 1
+                            out_samp = ""
+                            for (i = start_idx; i <= n_samp; i++) {
+                                if (samp_arr[i] != "") {
+                                    out_samp = (out_samp == "") ? samp_arr[i] : out_samp "," samp_arr[i]
+                                }
+                            }
+                            printf "%d %d %d %d %.0f %.0f %d %.0f %d %s\n", turns, planners, compacts, skip_drop, sigma, prev_ctx, prev_planner, prev_out, prev_ts, out_samp
+                        }' || true
+            )
+            if [ -n "$new_state" ]; then
+                read -r c_turns c_planners c_compacts c_skip_drop c_sigma c_prev_ctx c_prev_planner c_prev_out c_prev_ts c_samples <<<"$new_state"
+                c_offset="$new_offset"
+                {
+                    printf "%s\n" "$tpath"
+                    printf "%s %s %s %s %s %s %s %s %s %s %s\n" \
+                        "$c_offset" "$c_turns" "$c_planners" "$c_compacts" "$c_skip_drop" "$c_sigma" \
+                        "$c_prev_ctx" "$c_prev_planner" "$c_prev_out" "$c_prev_ts" "$c_samples"
+                } >"${cache_file}.tmp" 2>/dev/null && mv -f "${cache_file}.tmp" "$cache_file" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    local display_turns="$c_turns"
+    if [ "$display_turns" -eq 0 ] && [ "$c_planners" -gt 0 ]; then
+        display_turns=1
+    fi
+
+    local avg_tps=0
+    if [ -n "$c_samples" ]; then
+        avg_tps=$(LC_NUMERIC=C awk -v s="$c_samples" 'BEGIN {
+            n = split(s, arr, ",")
+            sum_out = 0; sum_dt = 0
+            for (i = 1; i <= n; i++) {
+                if (split(arr[i], kv, ":") == 2) {
+                    sum_out += kv[1] + 0
+                    sum_dt += kv[2] + 0
+                }
+            }
+            if (sum_dt > 0) printf "%.6f", sum_out / sum_dt
+            else printf "0"
+        }')
+    fi
+
+    printf "%d %d %.0f %s 1\n" "$display_turns" "$c_compacts" "$c_sigma" "$avg_tps"
+}
+
+truncate_ansi_line() {
+    local line="$1"
+    local max_cols="$2"
+    local expanded
+    expanded=$(printf "%b" "$line")
+    LC_ALL=C awk -v maxw="$max_cols" '
     BEGIN {
-        turns = 0
-        compacts = 0
-        sigma = 0
-        prev_ctx = 0
-        prev_planner = 0
-        prev_out = 0
-        prev_ts = -1
-        n_samples = 0
+        for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i
+    }
+    function char_width(cp) {
+        if (cp >= 65024 && cp <= 65039) return 0
+        if (cp == 8205) return 0
+        if (cp == 8986 || cp == 8987) return 2
+        if ((cp >= 11904 && cp <= 40959) || (cp >= 63744 && cp <= 64255) || (cp >= 65072 && cp <= 65135) || (cp >= 65280 && cp <= 65519)) return 2
+        return 1
     }
     {
-        head = (length($0) > 400) ? substr($0, 1, 400) : $0
-        stype = json_str(head, "type")
-        if (stype == "") next
-        ts_str = json_str(head, "created_at")
-        ts = (ts_str != "") ? iso_to_epoch(ts_str) : -1
-        if (prev_planner && stype == "GENERIC" && ts >= 0 && prev_ts >= 0) {
-            dt = ts - prev_ts
-            if (dt >= 1.0 && dt <= 120.0 && prev_out > 0) {
-                n_samples++
-                samp_out[n_samples] = prev_out
-                samp_dt[n_samples] = dt
+        s = $0
+        n = length(s)
+        i = 1
+        vis = 0
+        out = ""
+        last_fit_out = ""
+        truncated = 0
+
+        while (i <= n) {
+            c = substr(s, i, 1)
+            b = ord[c]
+
+            if (b == 27 && i < n && substr(s, i + 1, 1) == "[") {
+                j = i + 2
+                while (j <= n) {
+                    jc = substr(s, j, 1)
+                    if (jc ~ /[A-Za-z]/) break
+                    j++
+                }
+                seq = substr(s, i, j - i + 1)
+                out = out seq
+                if (vis <= maxw - 1) last_fit_out = last_fit_out seq
+                i = j + 1
+                continue
             }
-        }
-        prev_planner = 0
-        if (stype == "CHECKPOINT" || stype == "COMPACT") {
-            compacts++
-        } else if (stype == "PLANNER_RESPONSE") {
-            turns++
-            s_in = json_num(head, "input_tokens")
-            s_cr = json_num(head, "cache_read_tokens")
-            s_out = json_num(head, "output_tokens")
-            sigma += s_in + s_cr + s_out
-            cur_ctx = s_in + s_cr
-            if (prev_ctx > 0 && (prev_ctx - cur_ctx) > 30000) {
-                compacts++
+
+            if (b < 128) {
+                tok = c
+                cw = (b >= 32) ? 1 : 0
+                step = 1
+            } else if (b >= 194 && b <= 223 && i + 1 <= n) {
+                b2 = ord[substr(s, i + 1, 1)]
+                cp = (b - 192) * 64 + (b2 - 128)
+                tok = substr(s, i, 2)
+                cw = char_width(cp)
+                step = 2
+            } else if (b >= 224 && b <= 239 && i + 2 <= n) {
+                b2 = ord[substr(s, i + 1, 1)]
+                b3 = ord[substr(s, i + 2, 1)]
+                cp = (b - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
+                tok = substr(s, i, 3)
+                cw = char_width(cp)
+                step = 3
+            } else if (b >= 240 && b <= 247 && i + 3 <= n) {
+                tok = substr(s, i, 4)
+                cw = 2
+                step = 4
+            } else {
+                tok = c
+                cw = 1
+                step = 1
             }
-            prev_ctx = cur_ctx
-            prev_planner = 1
-            prev_out = s_out
-            prev_ts = ts
-        }
-    }
-    END {
-        avg_tps = 0
-        if (n_samples > 0) {
-            start_idx = (n_samples > 10) ? (n_samples - 9) : 1
-            sum_out = 0
-            sum_dt = 0
-            for (i = start_idx; i <= n_samples; i++) {
-                sum_out += samp_out[i]
-                sum_dt += samp_dt[i]
+
+            if (vis + cw > maxw) {
+                truncated = 1
+                break
             }
-            if (sum_dt > 0) avg_tps = sum_out / sum_dt
+            if (vis + cw <= maxw - 1) {
+                last_fit_out = last_fit_out tok
+            }
+            out = out tok
+            vis += cw
+            i += step
         }
-        printf "%d %d %.0f %.6f\n", turns, compacts, sigma, avg_tps
-    }' "$tpath" 2>/dev/null || printf "0 0 0 0\n"
+
+        if (truncated) {
+            if (maxw >= 1) printf "%s…\033[0m\n", last_fit_out
+            else printf "\033[0m\n"
+        } else {
+            printf "%s\n", out
+        }
+    }' <<<"$expanded"
+}
+
+emit_line() {
+    truncate_ansi_line "$1" "$COLS"
 }
 
 color_for_pct() {
@@ -335,19 +521,18 @@ build_quota_bar() {
 
 format_reset_time() {
     local reset_iso=$1
-    local style=$2 # "time" or "datetime"
+    local style=$2
     [ -z "$reset_iso" ] || [ "$reset_iso" = "null" ] && return
 
     local epoch=""
     if date -d "$reset_iso" +%s >/dev/null 2>&1; then
-        epoch=$(date -d "$reset_iso" +%s 2>/dev/null)
+        epoch=$(date -d "$reset_iso" +%s 2>/dev/null || true)
     elif date -j -f "%Y-%m-%dT%H:%M:%SZ" "$reset_iso" +%s >/dev/null 2>&1; then
-        epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$reset_iso" +%s 2>/dev/null)
+        epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$reset_iso" +%s 2>/dev/null || true)
     elif date -j -f "%Y-%m-%dT%H:%M:%S%z" "$reset_iso" +%s >/dev/null 2>&1; then
         local clean_iso
-        # Strip colon from ISO-8601 offset for BSD date (%z requires no colon)
         clean_iso="${reset_iso%:*}${reset_iso##*:}"
-        epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$clean_iso" +%s 2>/dev/null)
+        epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$clean_iso" +%s 2>/dev/null || true)
     fi
 
     [ -z "$epoch" ] && return
@@ -355,15 +540,15 @@ format_reset_time() {
     local result=""
     if date --version >/dev/null 2>&1; then
         if [ "$style" = "time" ]; then
-            result=$(date -d "@$epoch" +"%H:%M" 2>/dev/null)
+            result=$(date -d "@$epoch" +"%H:%M" 2>/dev/null || true)
         else
-            result=$(date -d "@$epoch" +"%b %-d, %H:%M" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            result=$(date -d "@$epoch" +"%b %-d, %H:%M" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
         fi
     else
         if [ "$style" = "time" ]; then
-            result=$(date -r "$epoch" +"%H:%M" 2>/dev/null)
+            result=$(date -r "$epoch" +"%H:%M" 2>/dev/null || true)
         else
-            result=$(date -r "$epoch" +"%b %e, %H:%M" 2>/dev/null | tr '[:upper:]' '[:lower:]' | sed 's/  */ /g')
+            result=$(date -r "$epoch" +"%b %e, %H:%M" 2>/dev/null | tr '[:upper:]' '[:lower:]' | sed 's/  */ /g' || true)
         fi
     fi
 
@@ -436,14 +621,16 @@ done
 # ─── LINE 2: Context Bar & Stats ─────────────────────────────────────────────
 read -r CTX_USED_TOK CACHE_DENOM CACHE_PCT <<<"$(
     LC_NUMERIC=C awk -v max_tok="$CTX_MAX_TOK" -v used_pct="$USED_PCT" \
-        -v tot_in="$TOTAL_IN_TOK" -v tot_out="$TOTAL_OUT_TOK" \
+        -v tot_in="$TOTAL_IN_TOK" \
         -v cur_in="$CUR_IN_TOK" -v cur_cc="$CUR_CACHE_CREATE" -v cur_cr="$CUR_CACHE_READ" '
     BEGIN {
-        host_used = tot_in + tot_out
         prompt_tok = cur_in + cur_cc + cur_cr
-        ctx_used = (host_used > 0) ? host_used : prompt_tok
-        if (ctx_used <= 0 && max_tok > 0 && used_pct > 0) {
+        if (max_tok > 0 && used_pct > 0) {
             ctx_used = max_tok * used_pct / 100.0
+        } else if (prompt_tok > 0) {
+            ctx_used = prompt_tok
+        } else {
+            ctx_used = tot_in
         }
         cache_pct = (prompt_tok > 0) ? (cur_cr * 100.0 / prompt_tok) : 0
         printf "%.0f %.0f %.6f\n", ctx_used, prompt_tok, cache_pct
@@ -451,19 +638,16 @@ read -r CTX_USED_TOK CACHE_DENOM CACHE_PCT <<<"$(
 )"
 
 NORM_TRANSCRIPT_PATH=$(normalize_transcript_path "$TRANSCRIPT_PATH")
-read -r TURNS_COUNT COMPACT_COUNT SIGMA_TOKENS AVG_TOK_PER_SEC <<<"$(parse_transcript_metrics "$NORM_TRANSCRIPT_PATH")"
+read -r TURNS_COUNT COMPACT_COUNT SIGMA_TOKENS AVG_TOK_PER_SEC HAS_TRANSCRIPT <<<"$(parse_transcript_metrics "$NORM_TRANSCRIPT_PATH")"
 
-if LC_NUMERIC=C awk -v s="$SIGMA_TOKENS" 'BEGIN { exit !(s <= 0) }'; then
-    SIGMA_TOKENS=$(LC_NUMERIC=C awk -v tot_in="$TOTAL_IN_TOK" -v tot_out="$TOTAL_OUT_TOK" -v ctx_used="$CTX_USED_TOK" '
-    BEGIN {
-        host_tot = tot_in + tot_out
-        printf "%.0f", (host_tot > 0) ? host_tot : ctx_used
-    }')
+bar_len="$CONFIG_BAR_LEN_CTX"
+if [ "$COLS" -lt "$CONFIG_LAYOUT_WIDE_COLS" ]; then
+    bar_len="$CONFIG_BAR_LEN_CTX_NARROW"
 fi
 
 PCT_INT=$(LC_NUMERIC=C printf "%.0f" "$USED_PCT" 2>/dev/null || echo 0)
-FILLED=$(((PCT_INT * CONFIG_BAR_LEN_CTX) / 100))
-REMAINDER=$(((PCT_INT * CONFIG_BAR_LEN_CTX) % 100))
+FILLED=$(((PCT_INT * bar_len) / 100))
+REMAINDER=$(((PCT_INT * bar_len) % 100))
 
 if [ "$PCT_INT" -ge "$CONFIG_CTX_CRIT_PCT" ]; then
     BAR_COLOR="$FG_BRIGHT_RED"
@@ -474,7 +658,7 @@ else
 fi
 
 BAR=""
-for ((i = 0; i < CONFIG_BAR_LEN_CTX; i++)); do
+for ((i = 0; i < bar_len; i++)); do
     if [ "$i" -lt "$FILLED" ]; then
         BAR="${BAR}█"
     elif [ "$i" -eq "$FILLED" ]; then
@@ -502,61 +686,58 @@ else
 fi
 
 telemetry_parts=()
-telemetry_parts+=("${FG_GRAY}Turns: ${NUM_COLOR}${TURNS_COUNT} ${FG_GRAY}(Compact: ${NUM_COLOR}${COMPACT_COUNT}${FG_GRAY})${R}")
+if [ "$HAS_TRANSCRIPT" -eq 1 ]; then
+    telemetry_parts+=("${FG_GRAY}Turns: ${NUM_COLOR}${TURNS_COUNT} ${FG_GRAY}(Compact: ${NUM_COLOR}${COMPACT_COUNT}${FG_GRAY})${R}")
+fi
 if LC_NUMERIC=C awk -v d="$CACHE_DENOM" 'BEGIN { exit !(d > 0) }'; then
     CACHE_PCT_FMT=$(LC_NUMERIC=C printf "%.1f" "$CACHE_PCT" 2>/dev/null || echo "0.0")
     CACHE_READ_FMT=$(format_tok "$CUR_CACHE_READ")
     telemetry_parts+=("${FG_GRAY}Cache: ${NUM_COLOR}${CACHE_PCT_FMT}% ${FG_GRAY}(${NUM_COLOR}${CACHE_READ_FMT}${FG_GRAY})${R}")
 fi
-if LC_NUMERIC=C awk -v s="$SIGMA_TOKENS" 'BEGIN { exit !(s > 0) }'; then
+if [ "$HAS_TRANSCRIPT" -eq 1 ] && LC_NUMERIC=C awk -v s="$SIGMA_TOKENS" 'BEGIN { exit !(s > 0) }'; then
     SIGMA_FMT=$(format_tok "$SIGMA_TOKENS")
     telemetry_parts+=("${FG_GRAY}${charSigma}Tok: ${NUM_COLOR}${SIGMA_FMT}${R}")
 fi
-if LC_NUMERIC=C awk -v a="$AVG_TOK_PER_SEC" 'BEGIN { exit !(a > 0) }'; then
+if [ "$HAS_TRANSCRIPT" -eq 1 ] && LC_NUMERIC=C awk -v a="$AVG_TOK_PER_SEC" 'BEGIN { exit !(a > 0) }'; then
     AVG_FMT=$(LC_NUMERIC=C printf "%.0f" "$AVG_TOK_PER_SEC" 2>/dev/null || echo "0")
     telemetry_parts+=("${FG_GRAY}Avg: ${NUM_COLOR}~${AVG_FMT} tok/s${R}")
 fi
 
+extra_parts=()
 if [ "$show_additional_stats" = true ]; then
     if [ "$hide_zero_stats" = false ] || [ "$ARTIFACTS" -gt 0 ]; then
-        telemetry_parts+=("${FG_GRAY}artifacts ${NUM_COLOR}${ARTIFACTS}${R}")
+        extra_parts+=("${FG_GRAY}artifacts ${NUM_COLOR}${ARTIFACTS}${R}")
     fi
     if [ "$hide_zero_stats" = false ] || [ "$SUBAGENTS" -gt 0 ]; then
-        telemetry_parts+=("${FG_GRAY}subagents ${NUM_COLOR}${SUBAGENTS}${R}")
+        extra_parts+=("${FG_GRAY}subagents ${NUM_COLOR}${SUBAGENTS}${R}")
     fi
     if [ "$hide_zero_stats" = false ] || [ "$BG_TASKS" -gt 0 ]; then
-        telemetry_parts+=("${FG_GRAY}tasks ${NUM_COLOR}${BG_TASKS}${R}")
+        extra_parts+=("${FG_GRAY}tasks ${NUM_COLOR}${BG_TASKS}${R}")
     fi
     if [ "$SANDBOX" = "true" ]; then
-        telemetry_parts+=("${FG_GRAY}sandbox ${FG_BRIGHT_GREEN}${B}ON${R}")
+        extra_parts+=("${FG_GRAY}sandbox ${FG_BRIGHT_GREEN}${B}ON${R}")
     elif [ "$hide_zero_stats" = false ]; then
-        telemetry_parts+=("${FG_GRAY}sandbox off${R}")
+        extra_parts+=("${FG_GRAY}sandbox off${R}")
     fi
 fi
 
+all_telemetry=("${telemetry_parts[@]}" "${extra_parts[@]}")
+
+join_with() {
+    local sep="$1"
+    shift
+    local out="" item
+    for item in "$@"; do
+        if [ -n "$out" ]; then
+            out+="$sep"
+        fi
+        out+="$item"
+    done
+    printf "%s" "$out"
+}
+
 PIPE_SEP="${FG_GRAY} ${charPipe} ${R}"
-LINE_TELEMETRY=""
-for ((i = 0; i < ${#telemetry_parts[@]}; i++)); do
-    if [ "$i" -gt 0 ]; then
-        LINE_TELEMETRY+="$PIPE_SEP"
-    fi
-    LINE_TELEMETRY+="${telemetry_parts[$i]}"
-done
-
-stat_parts=()
-stat_parts+=("$CTX")
-for tp in "${telemetry_parts[@]}"; do
-    stat_parts+=("$tp")
-done
-
 DOT="${FG_GRAY} · ${R}"
-LINE2=" "
-for ((i = 0; i < ${#stat_parts[@]}; i++)); do
-    if [ "$i" -gt 0 ]; then
-        LINE2+="$DOT"
-    fi
-    LINE2+="${stat_parts[$i]}"
-done
 
 # ─── Quota Progress Bars ─────────────────────────────────────────────────────
 quota_lines=()
@@ -577,12 +758,10 @@ if [ "$show_quota" = true ]; then
         pool_label="gemini"
     fi
 
-    # 5h Quota
     if line_5h=$(format_quota_line "${pool_label} 5h" "$Q_5H_REM" "$Q_5H_RESET" "time"); then
         quota_lines+=("$line_5h")
     fi
 
-    # Weekly Quota
     if line_wk=$(format_quota_line "${pool_label} 7d" "$Q_WK_REM" "$Q_WK_RESET" "datetime"); then
         quota_lines+=("$line_wk")
     fi
@@ -594,60 +773,41 @@ fi
 
 # ─── Render Layout Based on Terminal Width ───────────────────────────────────
 if [ "$COLS" -ge "$CONFIG_LAYOUT_WIDE_COLS" ]; then
-    # Wide layout
-    echo -e "${LINE1}${FG_GRAY}  ${charPipe}  ${R}${CTX}"
-    echo -e "${LINE_TELEMETRY}"
+    emit_line "${LINE1}${FG_GRAY}  ${charPipe}  ${R}${CTX}"
+    if [ "${#all_telemetry[@]}" -gt 0 ]; then
+        emit_line "$(join_with "$PIPE_SEP" "${all_telemetry[@]}")"
+    fi
 elif [ "$COLS" -ge "$CONFIG_LAYOUT_MED_COLS" ]; then
-    # Medium layout
-    echo -e "${FG_GRAY}╭─${R} ${LINE1}"
-    echo -e "${FG_GRAY}╰─${R}${LINE2}"
+    emit_line "${FG_GRAY}╭─${R} ${LINE1}"
+    if [ "${#all_telemetry[@]}" -gt 0 ]; then
+        emit_line "${FG_GRAY}├─${R} ${CTX}"
+        emit_line "${FG_GRAY}╰─${R} $(join_with "$DOT" "${all_telemetry[@]}")"
+    else
+        emit_line "${FG_GRAY}╰─${R} ${CTX}"
+    fi
 else
-    # Narrow layout: split into 4 structured lines
     parts_1a=()
     [ -n "$S" ] && parts_1a+=("$S")
     [ -n "$MODEL_NAME" ] && [ "$MODEL_NAME" != "null" ] && parts_1a+=("${FG_BRIGHT_MAGENTA}${I}${MODEL_NAME}${R}")
+    LINE1A=$(join_with "${FG_GRAY} ${charSlash} ${R}" "${parts_1a[@]}")
 
-    LINE1A=""
-    for ((i = 0; i < ${#parts_1a[@]}; i++)); do
-        if [ "$i" -gt 0 ]; then
-            LINE1A+="${FG_GRAY} ${charSlash} ${R}"
-        fi
-        LINE1A+="${parts_1a[$i]}"
-    done
+    emit_line "${FG_GRAY}╭─${R} ${LINE1A}"
+    emit_line "${FG_GRAY}├─${R} ${DBlock}"
 
-    LINE1B="$DBlock"
-    LINE2A=" ${CTX}"
-
-    stats_only=()
-    for ((i = 1; i < ${#stat_parts[@]}; i++)); do
-        stats_only+=("${stat_parts[$i]}")
-    done
-
-    if [ "${#stats_only[@]}" -gt 0 ]; then
-        LINE2B=" "
-        for ((i = 0; i < ${#stats_only[@]}; i++)); do
-            if [ "$i" -gt 0 ]; then
-                LINE2B+="$DOT"
-            fi
-            LINE2B+="${stats_only[$i]}"
-        done
-
-        echo -e "${FG_GRAY}╭─${R} ${LINE1A}"
-        echo -e "${FG_GRAY}├─${R} ${LINE1B}"
-        echo -e "${FG_GRAY}├─${R}${LINE2A}"
-        echo -e "${FG_GRAY}╰─${R}${LINE2B}"
+    if [ "${#telemetry_parts[@]}" -gt 0 ] && [ "${#extra_parts[@]}" -gt 0 ]; then
+        emit_line "${FG_GRAY}├─${R} ${CTX}"
+        emit_line "${FG_GRAY}├─${R} $(join_with "$DOT" "${telemetry_parts[@]}")"
+        emit_line "${FG_GRAY}╰─${R} $(join_with "$DOT" "${extra_parts[@]}")"
+    elif [ "${#all_telemetry[@]}" -gt 0 ]; then
+        emit_line "${FG_GRAY}├─${R} ${CTX}"
+        emit_line "${FG_GRAY}╰─${R} $(join_with "$DOT" "${all_telemetry[@]}")"
     else
-        echo -e "${FG_GRAY}╭─${R} ${LINE1A}"
-        echo -e "${FG_GRAY}├─${R} ${LINE1B}"
-        echo -e "${FG_GRAY}╰─${R}${LINE2A}"
+        emit_line "${FG_GRAY}╰─${R} ${CTX}"
     fi
 fi
 
 for qLine in "${quota_lines[@]}"; do
-    echo -e "$qLine"
+    emit_line "$qLine"
 done
-
-# Add a trailing empty line for padding at the bottom of the terminal
-echo ""
 
 exit 0

@@ -7,22 +7,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GEMINI_DIR="$HOME/.gemini"
 DEST_SCRIPT="$GEMINI_DIR/statusline.sh"
 CONFIG_FILE="$GEMINI_DIR/statusline.json"
+BACKUP_FILE="$GEMINI_DIR/statusline.prev.json"
 SETTINGS_FILE="$GEMINI_DIR/antigravity-cli/settings.json"
 
 echo "Installing Unified AGY Statusline..."
 
-# Precondition check: verify jq is installed since it is required by both the installer and statusline script
 if ! command -v jq &>/dev/null; then
     echo "Error: 'jq' is not installed. It is required to install and run the Unified AGY Statusline."
     echo "Please install jq using your package manager (e.g., 'brew install jq' on macOS or 'sudo apt install jq' on Debian/Ubuntu) and try again."
     exit 1
 fi
 
-# 1. Create .gemini directory if it doesn't exist
 mkdir -p "$GEMINI_DIR"
 echo "Ensured directory exists: $GEMINI_DIR"
 
-# 2. Copy the script and make it executable
 if [ ! -f "$SCRIPT_DIR/statusline.sh" ]; then
     echo "Error: statusline.sh not found in $SCRIPT_DIR"
     exit 1
@@ -31,7 +29,6 @@ cp "$SCRIPT_DIR/statusline.sh" "$DEST_SCRIPT"
 chmod +x "$DEST_SCRIPT"
 echo "Copied statusline.sh to: $DEST_SCRIPT"
 
-# 3. Create default configuration if not present
 if [ ! -f "$CONFIG_FILE" ]; then
     cat <<EOF >"$CONFIG_FILE"
 {
@@ -46,7 +43,6 @@ else
     echo "Configuration file already exists at $CONFIG_FILE (skipping override)."
 fi
 
-# 4. Update settings.json
 read -r -d '' MANUAL_SNIPPET <<EOF || true
   "statusLine": {
     "type": "command",
@@ -56,9 +52,24 @@ read -r -d '' MANUAL_SNIPPET <<EOF || true
 EOF
 
 if [ -f "$SETTINGS_FILE" ]; then
-    # Create temp file to avoid clobbering during stream read
     temp_settings=$(mktemp)
     trap 'rm -f "$temp_settings"' EXIT
+
+    has_statusline=$(jq -r 'has("statusLine")' "$SETTINGS_FILE" 2>/dev/null || echo "false")
+    if [ "$has_statusline" = "false" ]; then
+        if [ ! -f "$BACKUP_FILE" ]; then
+            printf '{"__absent__":true}\n' >"$BACKUP_FILE"
+        fi
+    else
+        prev_cmd=$(jq -r '.statusLine.command // ""' "$SETTINGS_FILE" 2>/dev/null || echo "")
+        case "$prev_cmd" in
+            *statusline.sh*) ;;
+            *)
+                jq '.statusLine' "$SETTINGS_FILE" >"$BACKUP_FILE" 2>/dev/null || true
+                echo "Backed up previous statusLine config to: $BACKUP_FILE"
+                ;;
+        esac
+    fi
 
     if jq --arg cmd "$DEST_SCRIPT" '.statusLine = {type: "command", command: $cmd, enabled: true}' "$SETTINGS_FILE" >"$temp_settings"; then
         mv "$temp_settings" "$SETTINGS_FILE"

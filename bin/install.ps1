@@ -6,20 +6,19 @@ $userProfile = [System.Environment]::GetFolderPath("UserProfile")
 $geminiDir = Join-Path $userProfile ".gemini"
 $destScript = Join-Path $geminiDir "statusline.ps1"
 $configFile = Join-Path $geminiDir "statusline.json"
+$backupFile = Join-Path $geminiDir "statusline.prev.json"
 $settingsFile = Join-Path $geminiDir "antigravity-cli\settings.json"
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 Write-Host "Installing Unified AGY Statusline..." -ForegroundColor Cyan
 
-# 1. Create .gemini directory if it doesn't exist
 if (-not (Test-Path $geminiDir)) {
     New-Item -ItemType Directory -Path $geminiDir -Force | Out-Null
     Write-Host "Created directory: $geminiDir"
 }
 
-# 2. Copy the script
 $srcScript = Join-Path $PSScriptRoot "statusline.ps1"
 if (-not (Test-Path $srcScript)) {
-    # If run outside bin/ directory, check root or current dir
     $srcScript = Join-Path $PSScriptRoot "bin\statusline.ps1"
     if (-not (Test-Path $srcScript)) {
         $srcScript = "bin\statusline.ps1"
@@ -29,7 +28,6 @@ if (-not (Test-Path $srcScript)) {
 Copy-Item -Path $srcScript -Destination $destScript -Force
 Write-Host "Copied statusline.ps1 to: $destScript" -ForegroundColor Green
 
-# 3. Create default configuration if not present
 if (-not (Test-Path $configFile)) {
     $defaultConfig = @{
         show_quota = $true
@@ -37,13 +35,12 @@ if (-not (Test-Path $configFile)) {
         hide_zero_stats = $true
         show_state_indicator = $true
     }
-    $defaultConfig | ConvertTo-Json | Set-Content -Path $configFile -Force
+    [System.IO.File]::WriteAllText($configFile, ($defaultConfig | ConvertTo-Json), $utf8NoBom)
     Write-Host "Created default configuration at: $configFile" -ForegroundColor Green
 } else {
     Write-Host "Configuration file already exists at $configFile (skipping override)." -ForegroundColor Yellow
 }
 
-# 4. Update settings.json
 if ($destScript.Contains(" ")) {
     $cmd = "powershell -NoProfile -ExecutionPolicy Bypass -File '$destScript'"
 } else {
@@ -61,21 +58,32 @@ $manualSnippet = @"
 
 if (Test-Path $settingsFile) {
     try {
-        $settingsJson = Get-Content $settingsFile -Raw
+        $settingsJson = [System.IO.File]::ReadAllText($settingsFile, [System.Text.Encoding]::UTF8)
         $settings = ConvertFrom-Json $settingsJson
 
-        # Ensure statusLine member exists
-        if ($null -eq $settings.statusLine) {
-            $settings | Add-Member -MemberType NoteProperty -Name "statusLine" -Value (New-Object PSObject)
+        $existingProp = $settings.PSObject.Properties["statusLine"]
+        if ($null -eq $existingProp) {
+            if (-not (Test-Path $backupFile)) {
+                [System.IO.File]::WriteAllText($backupFile, '{"__absent__":true}', $utf8NoBom)
+            }
+        } else {
+            $prevCmd = if ($existingProp.Value -and $existingProp.Value.command) { $existingProp.Value.command.ToString() } else { "" }
+            if ($prevCmd -notlike "*statusline.ps1*") {
+                $prevJson = $existingProp.Value | ConvertTo-Json -Depth 10
+                [System.IO.File]::WriteAllText($backupFile, $prevJson, $utf8NoBom)
+                Write-Host "Backed up previous statusLine config to: $backupFile" -ForegroundColor Yellow
+            }
         }
 
-        $settings.statusLine.type = "command"
-        $settings.statusLine.command = $cmd
-        $settings.statusLine.enabled = $true
+        $newStatusLine = [PSCustomObject]@{
+            type = "command"
+            command = $cmd
+            enabled = $true
+        }
+        $settings | Add-Member -MemberType NoteProperty -Name "statusLine" -Value $newStatusLine -Force
 
-        # Convert back to JSON and write to file
         $newJson = ConvertTo-Json $settings -Depth 10
-        Set-Content -Path $settingsFile -Value $newJson -Force
+        [System.IO.File]::WriteAllText($settingsFile, $newJson, $utf8NoBom)
         Write-Host "Successfully updated settings.json statusLine configuration!" -ForegroundColor Green
     } catch {
         Write-Warning "Could not update settings.json: $_"
@@ -87,4 +95,3 @@ if (Test-Path $settingsFile) {
     Write-Host "Please manually add this to your ${settingsFile}:" -ForegroundColor Yellow
     Write-Host $manualSnippet -ForegroundColor Cyan
 }
-
